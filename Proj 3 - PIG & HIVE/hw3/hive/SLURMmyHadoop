@@ -1,0 +1,145 @@
+#!/bin/bash
+##SBATCH --partition=debug
+#SBATCH --time=00:59:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --exclusive
+#SBATCH --job-name="Hive_vol_Small"
+#SBATCH --output=test-%J.out
+#SBATCH --mail-user=sankiran@buffalo.edu
+#Specifies that the job will be requeued after a node failure.
+#The default is that the job will not be requeued.
+#
+#This SLURM script is modified version of the SDSC script
+# found in /util/academic/myhadoop/myHadoop-0.30b/examples.
+# CDC January 29, 2015
+#
+echo "SLURM_JOBID="$SLURM_JOBID
+echo "SLURM_JOB_NODELIST"=$SLURM_JOB_NODELIST
+echo "SLURM_NNODES"=$SLURM_NNODES
+echo "SLURMTMPDIR="$SLURMTMPDIR
+
+echo "working directory = "$SLURM_SUBMIT_DIR
+
+module load java/1.6.0_22
+module load hadoop/2.5.1
+module load hive/0.14.0
+module load myhadoop/0.30b
+module list
+echo "MH_HOME="$MH_HOME
+echo "HADOOP_HOME="$HADOOP_HOME
+echo "Setting HADOOP to use SLURMTMPDIR on the local disk"
+export MH_SCRATCH_DIR=$SLURMTMPDIR
+echo "MH_SCRATCH_DIR="$MH_SCRATCH_DIR
+#### Set this to the directory where Hadoop configs should be generated
+# Don't change the name of this variable (HADOOP_CONF_DIR) as it is
+# required by Hadoop - all config files will be picked up from here
+#
+# Make sure that this is accessible to all nodes
+export HADOOP_CONF_DIR=$SLURM_SUBMIT_DIR/config-$SLURM_JOBID
+export HIVE_CONF_DIR=$SLURM_SUBMIT_DIR/config-$SLURM_JOBID
+echo "create diretory for HIVE metadata"
+### Set up the configuration
+# Make sure number of nodes is the same as what you have requested from PBS
+# usage: $myhadoop-configure.sh -h
+# this is the non-persistent mode
+NPROCS=`srun --nodes=${SLURM_NNODES} bash -c 'hostname' |wc -l`
+echo "-------Set up the configurations for myHadoop"
+$MH_HOME/bin/myhadoop-configure.sh 
+#
+cp $HIVE_HOME/conf/hive-env.sh-sample $HIVE_CONF_DIR/hive-env.sh
+cp $HIVE_HOME/conf/hive-default.xml-sample $HIVE_CONF_DIR/hive-default.xml
+sed -i 's:MY_HIVE_SCRATCH:'"$SLURMTMPDIR"':g' $HIVE_CONF_DIR/hive-default.xml
+cp $HIVE_HOME/conf/hive-log4j.properties-sample $HIVE_CONF_DIR/hive-log4j.properties
+sed -i 's:MY_HIVE_DIR:'"$SLURM_SUBMIT_DIR"':' $HIVE_CONF_DIR/hive-log4j.properties
+ls -l $HADOOP_CONF_DIR
+echo "-------Start hdfs and yarn ---"
+$HADOOP_HOME/sbin/start-all.sh
+#### Format HDFS, if this is the first time or not a persistent instance
+echo "-------Show Report ---"
+#$HADOOP_HOME/bin/hadoop dfsadmin -report
+echo "-------make directory ---"
+# DON'T CHANGE THSES COMMAND, AS YOU WILL NEED THESE DIRECTORY FOR CREATING TABLE
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -mkdir /tmp
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -mkdir -p /user/hive/warehouse
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -chmod g+w /tmp
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -chmod g+w /user/hive/warehouse
+#echo "-------list warehouse directory ---"
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -ls /user/hive/warehouse
+
+##Code to calculate Volatility
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS inputData;"
+$HIVE_HOME/bin/hive -e "create table inputData (date string,open_val string,high_val string,low_val string,cls_val string,vol string,adj_close string) row format delimited fields terminated by ',' stored as textfile;"
+
+$HIVE_HOME/bin/hive -e "LOAD DATA LOCAL INPATH '$1/*.csv' OVERWRITE INTO TABLE inputData;"
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS stktable;"
+$HIVE_HOME/bin/hive -e "CREATE TABLE stktable row format delimited fields terminated by '\t' stored as textfile as select INPUT__FILE__NAME compName,date date,adj_close adj_cls_val from inputData;"
+
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS reqTable;"
+$HIVE_HOME/bin/hive -e "CREATE TABLE reqTable
+(
+keys STRING,
+values STRING);"
+
+$HIVE_HOME/bin/hive -e "insert overwrite table reqTable SELECT CONCAT(SUBSTR(date,1,7),'::',compName) keys,CONCAT(SUBSTR(date,9,10),'::',adj_cls_val) values from stktable;"
+
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS GetMax_MinTemp;"
+$HIVE_HOME/bin/hive -e "CREATE TABLE GetMax_MinTemp
+(
+compName STRING,
+xvaltemp STRING,
+x String);"
+
+$HIVE_HOME/bin/hive -e "insert overwrite table GetMax_MinTemp SELECT SUBSTR(keys,10,LENGTH(keys)) compName,(SUBSTR(max(values),5,LENGTH(max(values)))-SUBSTR(min(values),5,LENGTH(min(values)))) as xvaltemp, SUBSTR(min(values),5,LENGTH(min(values))) as x from reqTable GROUP BY keys;"
+
+
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS GetMax_Min;"
+
+$HIVE_HOME/bin/hive -e "CREATE TABLE GetMax_Min
+(
+compName STRING,
+xval STRING);"
+
+$HIVE_HOME/bin/hive -e "insert overwrite table GetMax_Min SELECT compName as compName, (xvaltemp)/x as xval from GetMax_MinTemp;"
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS compName_meanx;"
+
+$HIVE_HOME/bin/hive -e "CREATE TABLE compName_meanx
+(
+meanx STRING,
+comp STRING);"
+
+$HIVE_HOME/bin/hive -e "insert overwrite table compName_meanx SELECT AVG(xval) as meanx,compName as comp from GetMax_Min GROUP BY compName;"
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS cat_table;"
+
+$HIVE_HOME/bin/hive -e "CREATE TABLE cat_table
+(
+compName STRING,
+xi_val STRING,
+xmean_val STRING);"
+
+$HIVE_HOME/bin/hive -e "insert overwrite table cat_table SELECT compName_meanx.comp as Stock,GetMax_Min.xval as xi_val,compName_meanx.meanx as xmean_val FROM GetMax_Min INNER JOIN compName_meanx ON GetMax_Min.compName=compName_meanx.comp;"
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS vol_calc;"
+$HIVE_HOME/bin/hive -e "CREATE TABLE vol_calc
+(
+compName STRING,
+vol_val_temp FLOAT);"
+
+$HIVE_HOME/bin/hive -e "insert overwrite table vol_calc SELECT compName,SQRT(SUM((xi_val-xmean_val)*(xi_val-xmean_val))/(COUNT(compName)-1) ) as vol_val_temp FROM cat_table GROUP BY compName;"
+
+$HIVE_HOME/bin/hive -e "select * from vol_calc WHERE vol_val_temp !=0 AND vol_val_temp is not NULL ORDER BY vol_val_temp LIMIT 10;"
+
+$HIVE_HOME/bin/hive -e "select * from vol_calc WHERE vol_val_temp !=0 AND vol_val_temp is not NULL ORDER BY vol_val_temp DESC LIMIT 10;"
+
+
+echo "-------Stop hdfs and yarn ---"
+$HADOOP_HOME/sbin/stop-all.sh
+
+#### Clean up the working directories after job completion
+$MH_HOME/bin/myhadoop-cleanup.sh

@@ -1,0 +1,1 @@
+In this project, we computed the monthly volatility of stocks, from a given daily data of 2970 stocks on NASDAQ on all trading days for a period of 3 years, using MapReduce on a Hadoop environment.
